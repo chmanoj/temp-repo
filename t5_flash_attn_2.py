@@ -1,5 +1,5 @@
-import torch
-import torch.nn as nn
+# Add missing import
+import math
 import time
 import psutil
 import os
@@ -45,6 +45,53 @@ class FlashT5Attention(nn.Module):
             self.relative_attention_bias = nn.Embedding(
                 self.relative_attention_num_buckets, self.n_heads
             )
+            
+    def _relative_position_bucket(self, relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+        """
+        Adapted from Mesh Tensorflow:
+        https://github.com/tensorflow/mesh/blob/0cb87fe7b8ac
+        """
+        relative_buckets = 0
+        if bidirectional:
+            num_buckets //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+        
+        # half of the buckets are for exact increments in positions
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+        relative_position_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        relative_position_if_large = torch.min(
+            relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+
+        relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
+        return relative_buckets
+
+    def compute_bias(self, query_length, key_length, device=None):
+        """Compute binned relative position bias"""
+        if device is None:
+            device = self.relative_attention_bias.weight.device
+        context_position = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        relative_position = memory_position - context_position  # shape (query_length, key_length)
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,  # shape (query_length, key_length)
+            bidirectional=(not self.is_decoder),
+            num_buckets=self.relative_attention_num_buckets,
+            max_distance=self.relative_attention_max_distance,
+        )
+        values = self.relative_attention_bias(relative_position_bucket)  # shape (query_length, key_length, num_heads)
+        values = values.permute([2, 0, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
+        return values
 
     def forward(
         self,
@@ -58,9 +105,12 @@ class FlashT5Attention(nn.Module):
         use_cache=False,
         output_attentions=False,
     ):
+        """
+        Forward pass that maintains compatibility with T5's expected output format
+        """
         batch_size, seq_len = hidden_states.shape[:2]
         
-        # Determine key/value states
+        # Determine real sequence length and key length
         real_seq_length = seq_len
         if past_key_value is not None:
             real_seq_length += past_key_value[0].shape[2] if past_key_value[0] is not None else 0
@@ -68,13 +118,13 @@ class FlashT5Attention(nn.Module):
         key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
         
         def shape(states):
-            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim)
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
         
         def unshape(states):
-            return states.contiguous().view(batch_size, -1, self.inner_dim)
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
 
         # Project to Q, K, V
-        query_states = shape(self.q(hidden_states))
+        query_states = shape(self.q(hidden_states))  # (batch, n_heads, seq_len, head_dim)
         
         if key_value_states is None:
             key_states = shape(self.k(hidden_states))
@@ -86,99 +136,178 @@ class FlashT5Attention(nn.Module):
         # Handle past key values for generation
         if past_key_value is not None:
             if key_value_states is None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                key_states = torch.cat([past_key_value[0], key_states], dim=-2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=-2)
             else:
                 key_states = past_key_value[0]
                 value_states = past_key_value[1]
+
+        # Compute position bias if needed
+        if position_bias is None and self.has_relative_attention_bias:
+            position_bias = self.compute_bias(real_seq_length, key_length, device=hidden_states.device)
 
         if use_cache:
             present_key_value = (key_states, value_states)
         else:
             present_key_value = None
 
-        # Use Flash Attention 2 if available
-        if FLASH_ATTN_AVAILABLE and query_states.dtype in [torch.float16, torch.bfloat16]:
+        # Use Flash Attention 2 if available and dtype is supported
+        if (FLASH_ATTN_AVAILABLE and 
+            query_states.dtype in [torch.float16, torch.bfloat16] and 
+            position_bias is None and  # Flash attention doesn't support position bias directly
+            layer_head_mask is None):  # Flash attention doesn't support head masking
+            
             # Flash Attention expects (batch_size, seq_len, n_heads, head_dim)
             q = query_states.transpose(1, 2)  # (batch, seq_len, n_heads, head_dim)
             k = key_states.transpose(1, 2)
             v = value_states.transpose(1, 2)
             
-            # Flash attention
-            attn_output = flash_attn_func(
-                q, k, v,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=self.is_decoder and key_value_states is None,
-            )
-            
-            attn_output = attn_output.transpose(1, 2)  # Back to (batch, n_heads, seq_len, head_dim)
-            attn_output = unshape(attn_output)
-            attn_weights = None  # Flash attention doesn't return weights
-            
+            try:
+                # Flash attention
+                attn_output = flash_attn_func(
+                    q, k, v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=self.is_decoder and key_value_states is None,
+                )
+                
+                attn_output = attn_output.transpose(1, 2)  # Back to (batch, n_heads, seq_len, head_dim)
+                attn_output = unshape(attn_output)
+                attn_weights = None  # Flash attention doesn't return weights
+                
+            except Exception as e:
+                print(f"Flash attention failed, falling back to standard: {e}")
+                # Fall back to standard attention
+                attn_output, attn_weights = self._standard_attention(
+                    query_states, key_states, value_states, position_bias, mask, layer_head_mask
+                )
+                attn_output = unshape(attn_output)
         else:
-            # Fallback to standard attention
-            scores = torch.matmul(
-                query_states.transpose(1, 2), key_states.transpose(1, 2).transpose(-1, -2)
-            ) / (self.key_value_proj_dim ** 0.5)
-            
-            if position_bias is None:
-                if not self.has_relative_attention_bias:
-                    position_bias = torch.zeros(
-                        (1, self.n_heads, real_seq_length, key_length),
-                        device=scores.device,
-                        dtype=scores.dtype,
-                    )
-            
-            if position_bias is not None:
-                scores += position_bias
-            
-            if mask is not None:
-                scores = scores.masked_fill(mask == 0, float("-inf"))
-            
-            attn_weights = nn.functional.softmax(scores, dim=-1)
-            attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-            
-            attn_output = torch.matmul(attn_weights, value_states.transpose(1, 2))
-            attn_output = unshape(attn_output.transpose(1, 2))
+            # Use standard attention
+            attn_output, attn_weights = self._standard_attention(
+                query_states, key_states, value_states, position_bias, mask, layer_head_mask
+            )
+            attn_output = unshape(attn_output)
 
         attn_output = self.o(attn_output)
 
+        # Return outputs in the format T5 expects
         outputs = (attn_output,)
         if output_attentions:
             outputs += (attn_weights,)
         if use_cache:
             outputs += (present_key_value,)
+        if position_bias is None and self.has_relative_attention_bias:
+            # T5 expects position_bias to be returned from the first layer
+            outputs = (attn_output, position_bias) + outputs[1:]
         
         return outputs
+    
+    def _standard_attention(self, query_states, key_states, value_states, position_bias, mask, layer_head_mask):
+        """Standard attention computation as fallback"""
+        # Compute attention scores
+        scores = torch.matmul(query_states, key_states.transpose(-1, -2))
+        scores = scores / math.sqrt(self.key_value_proj_dim)
+        
+        # Add position bias if available
+        if position_bias is not None:
+            scores = scores + position_bias
+
+        # Apply attention mask
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        # Apply layer head mask
+        if layer_head_mask is not None:
+            attn_weights = attn_weights * layer_head_mask
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, value_states)
+        
+        return attn_output, attn_weights
 
 class FlashT5ForConditionalGeneration(T5ForConditionalGeneration):
     """
-    T5 model with Flash Attention 2 integration
+    T5 model with Flash Attention 2 integration - more conservative approach
     """
     def __init__(self, config):
         super().__init__(config)
-        self._replace_attention_layers()
+        # Only replace if Flash Attention is available
+        if FLASH_ATTN_AVAILABLE:
+            self._replace_attention_layers()
+        else:
+            print("⚠️ Flash Attention not available, using standard T5 model")
     
     def _replace_attention_layers(self):
         """Replace standard attention with Flash Attention layers"""
-        if not FLASH_ATTN_AVAILABLE:
-            print("Flash Attention not available, using standard attention")
-            return
-            
-        # Replace encoder attention layers
-        for i, layer in enumerate(self.encoder.block):
-            has_relative_bias = i == 0  # Only first layer has relative attention bias
-            layer.layer[0].SelfAttention = FlashT5Attention(
-                self.config, has_relative_attention_bias=has_relative_bias
-            )
+        print("🔄 Replacing attention layers with Flash Attention...")
         
-        # Replace decoder attention layers
-        for i, layer in enumerate(self.decoder.block):
-            has_relative_bias = i == 0
-            layer.layer[0].SelfAttention = FlashT5Attention(
-                self.config, has_relative_attention_bias=has_relative_bias
-            )
-            layer.layer[1].EncDecAttention = FlashT5Attention(self.config)
+        try:
+            # Replace encoder attention layers
+            for i, layer in enumerate(self.encoder.block):
+                # Only first layer has relative attention bias
+                has_relative_bias = (i == 0)
+                original_attention = layer.layer[0].SelfAttention
+                
+                # Create new Flash attention layer
+                flash_attention = FlashT5Attention(self.config, has_relative_attention_bias=has_relative_bias)
+                
+                # Copy weights from original attention
+                flash_attention.q.weight.data.copy_(original_attention.q.weight.data)
+                flash_attention.k.weight.data.copy_(original_attention.k.weight.data)
+                flash_attention.v.weight.data.copy_(original_attention.v.weight.data)
+                flash_attention.o.weight.data.copy_(original_attention.o.weight.data)
+                
+                if has_relative_bias and hasattr(original_attention, 'relative_attention_bias'):
+                    flash_attention.relative_attention_bias.weight.data.copy_(
+                        original_attention.relative_attention_bias.weight.data
+                    )
+                
+                # Replace the attention layer
+                layer.layer[0].SelfAttention = flash_attention
+            
+            # Replace decoder attention layers
+            for i, layer in enumerate(self.decoder.block):
+                has_relative_bias = (i == 0)
+                
+                # Replace self-attention
+                original_self_attn = layer.layer[0].SelfAttention
+                flash_self_attn = FlashT5Attention(self.config, has_relative_attention_bias=has_relative_bias)
+                
+                # Copy weights
+                flash_self_attn.q.weight.data.copy_(original_self_attn.q.weight.data)
+                flash_self_attn.k.weight.data.copy_(original_self_attn.k.weight.data)
+                flash_self_attn.v.weight.data.copy_(original_self_attn.v.weight.data)
+                flash_self_attn.o.weight.data.copy_(original_self_attn.o.weight.data)
+                
+                if has_relative_bias and hasattr(original_self_attn, 'relative_attention_bias'):
+                    flash_self_attn.relative_attention_bias.weight.data.copy_(
+                        original_self_attn.relative_attention_bias.weight.data
+                    )
+                
+                layer.layer[0].SelfAttention = flash_self_attn
+                
+                # Replace cross-attention
+                original_cross_attn = layer.layer[1].EncDecAttention
+                flash_cross_attn = FlashT5Attention(self.config, has_relative_attention_bias=False)
+                
+                # Copy weights
+                flash_cross_attn.q.weight.data.copy_(original_cross_attn.q.weight.data)
+                flash_cross_attn.k.weight.data.copy_(original_cross_attn.k.weight.data)
+                flash_cross_attn.v.weight.data.copy_(original_cross_attn.v.weight.data)
+                flash_cross_attn.o.weight.data.copy_(original_cross_attn.o.weight.data)
+                
+                layer.layer[1].EncDecAttention = flash_cross_attn
+                
+            print("✅ Successfully replaced all attention layers with Flash Attention")
+            
+        except Exception as e:
+            print(f"❌ Error replacing attention layers: {e}")
+            print("🔄 Falling back to standard attention")
+            raise e
 
 def get_memory_usage():
     """Get current memory usage in MB"""
